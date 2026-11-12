@@ -1,0 +1,103 @@
+# CI: build and test on Linux, macOS and Windows. The test suite runs
+# under AddressSanitizer on Clang/GNU (HTTPROUTE20_SANITIZE defaults on
+# for local builds); MSVC builds without it — tests/CMakeLists.txt
+# prints a note and skips the flags there, since /fsanitize=address
+# conflicts with the Debug /RTC1 checks.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - name: linux-clang
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - name: macos-clang
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+          - name: windows-msvc
+            os: windows-latest
+            # The Visual Studio generator picks the toolset itself and
+            # ignores CC/CXX; the values just keep the env uniform.
+            cc: cl
+            cxx: cl
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # Every public header must be self-contained: each include/http/*.h
+  # compiles standalone with warnings as errors.
+  headers:
+    name: headers-self-contained
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Syntax-check each header with g++ and clang++
+        run: |
+          for cxx in g++ clang++; do
+            for header in include/http/*.h; do
+              echo "== $cxx $header"
+              "$cxx" -std=c++20 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror \
+                -I include -fsyntax-only -x c++ "$header"
+            done
+          done
+
+  # A consumer that vendors the library with add_subdirectory must get
+  # the header-only interface target only: no tests, no doctest fetch,
+  # no sanitizer flags.
+  vendored-consumer:
+    name: vendored-consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and run a vendored consumer
+        run: |
+          consumer=/tmp/httproute20-consumer
+          rm -rf "$consumer"
+          mkdir -p "$consumer"
+          cat > "$consumer/CMakeLists.txt" <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(consumer LANGUAGES CXX)
+          add_subdirectory("$ENV{GITHUB_WORKSPACE}" httproute20)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE httproute20::httproute20)
+          EOF
+          cat > "$consumer/main.cpp" <<'EOF'
+          #include <http/router.h>
+          int main() { return 0; }
+          EOF
+          cmake -S "$consumer" -B "$consumer/build" -DHTTPROUTE20_SANITIZE=OFF
+          cmake --build "$consumer/build" --parallel
+          "$consumer/build/consumer"
