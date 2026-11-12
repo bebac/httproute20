@@ -738,50 +738,6 @@ TEST_CASE("a catch-all matches a path longer than max_segments")
   CHECK(match.captures[0].value == "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q");
 }
 
-// --- query string ---
-
-TEST_CASE("the query string is not part of the path")
-{
-  httptest::router router;
-  std::optional<http::param_error> reported;
-  router.set_param_error_handler(
-    [&reported](httptest::test_request&, httptest::test_response&, http::param_error error) -> httptest::test_task {
-      reported = error;
-      co_return;
-    }
-  );
-  router.get("/entity/:id", &entity_handler);
-  router.get("/static/*path", &tail_handler);
-
-  // A query must not leak into the captured segment: the capture is "7",
-  // not "7?expand=all", so the segment parses and the handler runs.
-  auto with_query = router.match("GET", "/entity/7?expand=all");
-  REQUIRE(with_query.matched());
-  CHECK(with_query.pattern == "/entity/:id");
-  REQUIRE(with_query.captures.size() == 1);
-  CHECK(with_query.captures[0].value == "7");
-
-  httptest::test_request req;
-  httptest::test_response res;
-  (*with_query.handler)(req, res, with_query.captures);
-  CHECK_FALSE(reported.has_value());
-
-  // An empty query string is still a query string.
-  auto empty_query = router.match("GET", "/entity/7?");
-  REQUIRE(empty_query.matched());
-  CHECK(empty_query.captures[0].value == "7");
-
-  // A catch-all captures the path remainder only, without the query.
-  auto tail = router.match("GET", "/static/css/site.css?v=2");
-  REQUIRE(tail.matched());
-  CHECK(tail.pattern == "/static/*path");
-  REQUIRE(tail.captures.size() == 1);
-  CHECK(tail.captures[0].value == "css/site.css");
-
-  // A query on a path that matches nothing is still not found.
-  CHECK_FALSE(router.match("GET", "/nope?x=1").matched());
-}
-
 // --- percent-encoding ---
 
 TEST_CASE("the router does not percent-decode: captures are the raw path bytes")

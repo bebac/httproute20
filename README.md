@@ -187,11 +187,8 @@ without a catch-all matches only a path of exactly its own length;
 extra segments make it fail rather than being ignored. A catch-all is
 unaffected by path depth.
 
-Anything from `?` onward is the query string, not the path: `match`
-strips it before splitting, so `/entity/7?expand=all` matches
-`/entity/:id` with capture `7`, and a catch-all captures the path
-remainder only. Query parameters are not bound to handler parameters
-(parse-on-demand; see the roadmap).
+Query parameters are not part of the path and must be stripped off
+before calling match.
 
 Percent-encoding is the server's job too: `match()`/`handle()` take the
 path exactly as given and never decode, so captures are the raw path

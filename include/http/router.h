@@ -386,18 +386,12 @@ namespace http
 
     route_match match(std::string_view method, std::string_view path) const
     {
-      // The query string is not part of the path: strip everything from
-      // the first '?' before splitting, and hand the stripped path to the
-      // walk too, so a catch-all captures the path remainder only.
-      // "/entity/7?expand=all" therefore matches "/entity/:id" with
-      // capture "7".
-      const auto path_only = path.substr(0, path.find('?'));
-      const auto segments = split_path(path_only);
+      const auto segments = split_path(path);
       capture_list captures;
 
       if (const auto root = roots_.find(method); root != roots_.end())
       {
-        if (const node* hit = walk(&root->second, segments, 0, path_only, captures))
+        if (const node* hit = walk(&root->second, segments, 0, path, captures))
         {
           route_match result;
           result.handler = &hit->handler;
@@ -419,7 +413,7 @@ namespace http
         if (other_method == method)
           continue;
         scratch.count = 0;
-        if (walk(&trie, segments, 0, path_only, scratch) != nullptr && result.allowed_count < max_allowed_methods)
+        if (walk(&trie, segments, 0, path, scratch) != nullptr && result.allowed_count < max_allowed_methods)
           result.allowed_methods[result.allowed_count++] = other_method;
       }
       std::sort(result.allowed_methods.begin(), result.allowed_methods.begin() + static_cast<std::ptrdiff_t>(result.allowed_count));

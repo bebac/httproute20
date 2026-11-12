@@ -253,10 +253,8 @@ and must be immutable or externally synchronized.
   but a pattern without a catch-all matches only a path with exactly
   as many segments as the pattern has — extra segments make it fail
   rather than being ignored. A catch-all is unaffected by path depth.
-- The query string is not part of the path: `match` strips everything
-  from the first `?` before splitting, so a capture never contains it —
-  `/entity/7?expand=all` captures `7`. Query parameters are not bound
-  to handler parameters; that is deferred (parse-on-demand).
+- The query string is not part of the path and must be stripped off
+  before matching.
 - The router never percent-decodes: `match()`/`handle()` take the path
   exactly as given, so captures are raw bytes (`/u/a%2Fb` captures
   `a%2Fb`) and a literal segment matches raw text only. Decoding is the
