@@ -477,16 +477,15 @@ namespace http
         const capture_list* captures; // null: a capture failed to decode
       } state{&m, effective};
       next_fn terminal = [this, &req, &res, &state]() -> Task {
-        const route_match& m = *state.match;
         if (state.captures == nullptr)
         {
           if (param_error_ && *param_error_)
             co_await (*param_error_)(req, res, param_error::bad_path);
         }
-        else if (m.matched())
-          co_await (*m.handler)(req, res, *state.captures);
-        else if (m.method_not_allowed() && method_not_allowed_)
-          co_await method_not_allowed_(req, res, m.allowed());
+        else if (state.match->matched())
+          co_await (*state.match->handler)(req, res, *state.captures);
+        else if (state.match->method_not_allowed() && method_not_allowed_)
+          co_await method_not_allowed_(req, res, state.match->allowed());
         else if (not_found_)
           co_await not_found_(req, res);
       };
