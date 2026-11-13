@@ -29,6 +29,7 @@ endfunction()
 add_executable(httproute20_tests
   main.cpp
   test_router.cpp
+  test_segment_decoder.cpp
 )
 # doctest 2.5.x forward-declares std::basic_ostream itself unless this is
 # defined, which leaves the type incomplete in the test TUs. On MSVC,
@@ -114,3 +115,5 @@ add_compile_fail_test(empty_catch_all
   "is not a constant expression")
 add_compile_fail_test(bad_middleware
   "middleware_like")
+add_compile_fail_test(bad_decoder
+  "segment_decoder")

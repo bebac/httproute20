@@ -107,10 +107,12 @@ namespace http
   using next_fn = move_only_fn<Task()>;
 
   // What a request matched, passed to middleware as a fourth argument:
-  // the route template (e.g. "/entity/:id") and the raw captures, so
-  // access logging and metrics can see the route rather than the raw
-  // path. All members are non-owning views — into the router's trie and
-  // into handle()'s match — valid for the duration of the dispatch.
+  // the route template (e.g. "/entity/:id") and the captures as the
+  // handlers see them — decoded, when the router's segment decoder
+  // decodes — so access logging and metrics can see the route rather
+  // than the raw path. All members are non-owning views — into the
+  // router's trie and into handle()'s frame — valid for the duration
+  // of the dispatch.
   struct route_info
   {
     std::string_view pattern = {};

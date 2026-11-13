@@ -6,6 +6,7 @@
 #include "http/function.h"
 #include "http/params.h"
 #include "http/pattern.h"
+#include "http/segment_decoder.h"
 #include "http/traits.h"
 
 #include <algorithm>
@@ -45,6 +46,8 @@ namespace http
   //     response_like, middleware_like, ...) and handler-signature traits;
   //   - pattern.h: pattern validation — typed_pattern's consteval
   //     constructor and the pattern_text template-argument syntax;
+  //   - segment_decoder.h: the segment_decoder concept and the identity
+  //     default — how a router decodes percent-escaped paths;
   //   - here: dispatch — router, a per-method segment trie, plus the
   //     middleware onion (use/handle) composed around the matched handler
   //     at dispatch time.
@@ -95,7 +98,16 @@ namespace http
   //
   // Task/Req/Res are the consumer's coroutine task, request, and
   // response types, constrained by task_like/request_like/response_like.
-  template<typename Task, typename Req, typename Res>
+  //
+  // Decoder rewrites percent-escaped path segments (percent-decoding in
+  // the typical case) and is the identity by default: raw matching,
+  // exactly the pre-decoder behavior. With a real decoder, a literal
+  // segment that misses on the raw text is retried with its decoded
+  // form — so a pattern written in plain text matches both wire forms
+  // of an escaped segment — and the matched captures are decoded
+  // before middleware and handlers see them. Patterns themselves are
+  // always written in plain, decoded text.
+  template<typename Task, typename Req, typename Res, segment_decoder Decoder = identity_segment_decoder>
     requires task_like<Task> && request_like<Req> && response_like<Res>
   class router
   {
@@ -388,10 +400,15 @@ namespace http
     {
       const auto segments = split_path(path);
       capture_list captures;
+      // Scratch for the decoded-segment retry on a literal miss (see
+      // find_literal). Only a non-identity decoder with a '%' in the
+      // segment ever touches it; match() stays allocation-free either
+      // way.
+      std::array<char, decode_scratch_size> decode_scratch;
 
       if (const auto root = roots_.find(method); root != roots_.end())
       {
-        if (const node* hit = walk(&root->second, segments, 0, path, captures))
+        if (const node* hit = walk(&root->second, segments, 0, path, captures, decode_scratch))
         {
           route_match result;
           result.handler = &hit->handler;
@@ -413,7 +430,7 @@ namespace http
         if (other_method == method)
           continue;
         scratch.count = 0;
-        if (walk(&trie, segments, 0, path, scratch) != nullptr && result.allowed_count < max_allowed_methods)
+        if (walk(&trie, segments, 0, path, scratch, decode_scratch) != nullptr && result.allowed_count < max_allowed_methods)
           result.allowed_methods[result.allowed_count++] = other_method;
       }
       std::sort(result.allowed_methods.begin(), result.allowed_methods.begin() + static_cast<std::ptrdiff_t>(result.allowed_count));
@@ -430,10 +447,44 @@ namespace http
     Task handle(Req& req, Res& res, std::string_view method, std::string_view path) const
     {
       auto m = match(method, path);
-      const route_info info = m.info();
-      next_fn terminal = [this, &m, &req, &res]() -> Task {
+
+      // Percent-decoding (non-identity decoders only): the matched
+      // captures decode into this frame's arena before the onion, so
+      // middleware (route_info) and the handler see the same decoded
+      // values. A capture that cannot decode — malformed input, or an
+      // arena too small — is a bad_path param error: it reports through
+      // the param-error policy from inside the onion, like every other
+      // parameter-resolution failure. The identity decoder skips all of
+      // it; the raw captures go straight through.
+      [[maybe_unused]] std::array<char, capture_arena_size> arena;
+      [[maybe_unused]] capture_list decoded;
+      const capture_list* effective = &m.captures;
+      if constexpr (!std::is_same_v<Decoder, identity_segment_decoder>)
+      {
         if (m.matched())
-          co_await (*m.handler)(req, res, m.captures);
+          effective = decode_captures(m.captures, decoded, arena) ? &decoded : nullptr;
+      }
+      const capture_list& info_captures = effective ? *effective : m.captures;
+      const route_info info{
+        m.pattern, {info_captures.begin(), info_captures.end()}, m.matched(), m.method_not_allowed(), m.allowed()};
+
+      // The terminal keeps move_only_fn's inline buffer: this, the two
+      // references, and one pointer to the frame-local dispatch state
+      // are exactly four words (see bind_route).
+      struct dispatch_state
+      {
+        const route_match* match;
+        const capture_list* captures; // null: a capture failed to decode
+      } state{&m, effective};
+      next_fn terminal = [this, &req, &res, &state]() -> Task {
+        const route_match& m = *state.match;
+        if (state.captures == nullptr)
+        {
+          if (param_error_ && *param_error_)
+            co_await (*param_error_)(req, res, param_error::bad_path);
+        }
+        else if (m.matched())
+          co_await (*m.handler)(req, res, *state.captures);
         else if (m.method_not_allowed() && method_not_allowed_)
           co_await method_not_allowed_(req, res, m.allowed());
         else if (not_found_)
@@ -594,7 +645,58 @@ namespace http
     // A pattern without a catch-all matches only a path of exactly its
     // own length: running out of segments together is a match, running
     // out of pattern while the path continues is not.
-    static const node* walk(const node* current, const segment_list& segments, size_t index, std::string_view path, capture_list& captures)
+    // Literal-edge lookup. The raw segment is tried first — the common
+    // case needs no decoding and is bit-for-bit the raw-only path. Only
+    // a miss on a segment containing '%' retries with the decoded
+    // form, so a pattern written in plain text matches both wire forms
+    // of an escaped segment. The identity decoder never retries:
+    // decoding is the identity, so the retry could not find anything
+    // the first lookup missed.
+    const node* find_literal(const node* current, std::string_view segment, [[maybe_unused]] std::span<char> scratch) const
+    {
+      if (const auto it = current->literals.find(segment); it != current->literals.end())
+        return it->second.get();
+      if constexpr (!std::is_same_v<Decoder, identity_segment_decoder>)
+      {
+        if (segment.find('%') == std::string_view::npos)
+          return nullptr;
+        const auto decoded_segment = decoder_.decode(segment, scratch.data(), scratch.size());
+        if (!decoded_segment)
+          return nullptr;
+        if (const auto it = current->literals.find(*decoded_segment); it != current->literals.end())
+          return it->second.get();
+      }
+      return nullptr;
+    }
+
+    // Decodes the matched captures through the segment decoder into the
+    // caller's arena: values without '%' pass through as raw views (no
+    // copy), values with '%' decode into the arena. Returns false when
+    // a value cannot decode — malformed input, or the arena is too
+    // small — which handle() reports as bad_path.
+    bool decode_captures(const capture_list& raw, capture_list& decoded, std::span<char> arena) const
+    {
+      size_t used = 0;
+      for (size_t i = 0; i < raw.size(); ++i)
+      {
+        const capture& c = raw[i];
+        if (c.value.find('%') == std::string_view::npos)
+        {
+          decoded.push(c);
+          continue;
+        }
+        const auto decoded_value = decoder_.decode(c.value, arena.data() + used, arena.size() - used);
+        if (!decoded_value)
+          return false;
+        decoded.push(capture{c.name, *decoded_value});
+        used += decoded_value->size();
+      }
+      return true;
+    }
+
+    const node* walk(
+      const node* current, const segment_list& segments, size_t index, std::string_view path,
+      capture_list& captures, std::span<char> scratch) const
     {
       if (index == segments.size())
       {
@@ -607,15 +709,15 @@ namespace http
         return current->handler ? current : nullptr;
       }
 
-      if (const auto it = current->literals.find(segments[index]); it != current->literals.end())
+      if (const node* child = find_literal(current, segments[index], scratch))
       {
-        if (const node* hit = walk(it->second.get(), segments, index + 1, path, captures))
+        if (const node* hit = walk(child, segments, index + 1, path, captures, scratch))
           return hit;
       }
       if (current->param)
       {
         captures.push(capture{current->param->param_name, segments[index]});
-        if (const node* hit = walk(current->param.get(), segments, index + 1, path, captures))
+        if (const node* hit = walk(current->param.get(), segments, index + 1, path, captures, scratch))
           return hit;
         captures.pop();
       }
@@ -655,6 +757,10 @@ namespace http
     // Method keys are owned strings: route() accepts any string_view at
     // registration, and the transparent hash/equal let match() look up by
     // string_view without allocating.
+    // The segment decoder. Stateless by convention (default-constructed
+    // and no_unique_address, so an empty decoder costs nothing); the
+    // router calls only its const decode().
+    [[no_unique_address]] Decoder decoder_{};
     std::unordered_map<std::string, node, detail::string_hash, detail::string_equal> roots_;
     not_found_fn not_found_;
     method_not_allowed_fn method_not_allowed_;
